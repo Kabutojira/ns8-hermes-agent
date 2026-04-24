@@ -709,6 +709,14 @@ class HermesAuthProxyTest(unittest.TestCase):
         self.assertEqual(authproxy.target_route("/hermes-1/dashboard/api/status"), (1, "dashboard"))
         self.assertEqual(authproxy.target_route("/hermes-1"), (1, None))
 
+    def test_chat_alias_path_is_not_an_agent_route(self):
+        authproxy = self.load_authproxy()
+
+        self.assertIsNone(authproxy.target_route("/chat"))
+        self.assertTrue(authproxy.is_chat_alias_path("/chat"))
+        self.assertTrue(authproxy.is_chat_alias_path("/chat/api/models"))
+        self.assertEqual(authproxy.app_name_for_request_path("/chat"), "chat")
+
     def test_authenticated_user_header_uses_canonical_name(self):
         authproxy = self.load_authproxy()
 
@@ -840,6 +848,69 @@ class HermesAuthProxyTest(unittest.TestCase):
         self.assertEqual(len(uds_clients), 1)
         self.assertEqual(uds_clients[0].kwargs["transport"].uds, "/sockets/agent-1-chat.sock")
         self.assertEqual(uds_clients[0].calls[0]["kwargs"]["url"], "http://agent-1/api/models?provider=local")
+
+    def test_proxy_routes_session_chat_alias_to_chat_socket(self):
+        authproxy = self.load_authproxy()
+        config = self.socket_runtime_config(authproxy)
+
+        class FakeUpstreamResponse:
+            def __init__(self):
+                self.content = b"chat"
+                self.status_code = 200
+                self.headers = {"location": "/auth"}
+
+        class FakeUdsClient:
+            def __init__(self, *args, **kwargs):
+                self.kwargs = kwargs
+                self.calls = []
+
+            async def request(self, *args, **kwargs):
+                self.calls.append({"args": args, "kwargs": kwargs})
+                return FakeUpstreamResponse()
+
+            async def aclose(self):
+                return None
+
+        uds_clients = []
+
+        def build_fake_client(*args, **kwargs):
+            client = FakeUdsClient(*args, **kwargs)
+            uds_clients.append(client)
+            return client
+
+        request = self.make_request(
+            types.SimpleNamespace(),
+            headers={"x-forwarded-proto": "https"},
+            cookies={
+                authproxy.SESSION_COOKIE: json.dumps(
+                    {
+                        "allowed_user": "alice",
+                        "user_domain": config.user_domain,
+                        "agent_id": 1,
+                    }
+                )
+            },
+            path="/chat/api/models",
+            query="provider=local",
+            method="GET",
+        )
+
+        with mock.patch.object(authproxy, "load_config", return_value=config), mock.patch.object(
+            authproxy.httpx,
+            "AsyncClient",
+            side_effect=build_fake_client,
+        ), mock.patch.object(
+            authproxy.httpx,
+            "AsyncHTTPTransport",
+            side_effect=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        ):
+            response = asyncio.run(authproxy.proxy("chat/api/models", request))
+
+        self.assertEqual(response.kwargs["status_code"], 200)
+        self.assertEqual(len(uds_clients), 1)
+        self.assertEqual(uds_clients[0].kwargs["transport"].uds, "/sockets/agent-1-chat.sock")
+        self.assertEqual(uds_clients[0].calls[0]["kwargs"]["url"], "http://agent-1/api/models?provider=local")
+        self.assertEqual(response.kwargs["headers"]["location"], "/chat/auth")
 
     def test_proxy_routes_chat_post_requests_without_treating_them_as_login_forms(self):
         authproxy = self.load_authproxy()

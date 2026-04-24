@@ -24,10 +24,12 @@ From the UI, configure:
 
 Configuration will create the agents and publish one shared authenticated entrypoint at `https://hermes.example.com/`.
 
-Published paths are now per-agent and app-specific:
+Published paths are session-based with explicit per-agent routes also available:
 
-- `https://hermes.example.com/hermes-<id>/dashboard` → Hermes dashboard
-- `https://hermes.example.com/hermes-<id>/chat` → Open WebUI wired to that agent's local Hermes API server
+- `https://hermes.example.com/` → Hermes dashboard for the authenticated user's assigned agent
+- `https://hermes.example.com/chat` → Open WebUI for the authenticated user's assigned agent
+- `https://hermes.example.com/hermes-<id>/dashboard` → Hermes dashboard for agent `<id>`
+- `https://hermes.example.com/hermes-<id>/chat` → Open WebUI wired to agent `<id>`'s local Hermes API server
 
 Open WebUI runs without its own external login prompt; the shared auth proxy authenticates the NS8 user and then proxies the request to either the dashboard or chat socket.
 
@@ -230,23 +232,28 @@ Example output:
 ## Accessing the dashboard
 
 If `base_virtualhost` is configured, `https://<base_virtualhost>/` is the primary shared entrypoint.
-The shared auth service authenticates against the shared `user_domain`, maps the authenticated username to exactly one assigned running agent, and proxies the rest of that session's requests to the selected dashboard.
-`https://<base_virtualhost>/hermes-N/` remains an auth-owned login or session-status page for agent `N`; it is no longer a Traefik path route to the dashboard itself.
+The shared auth service authenticates against the shared `user_domain`, maps the authenticated username to exactly one assigned running agent, and proxies that session's app requests to the selected agent.
+`https://<base_virtualhost>/hermes-N/` remains an auth-owned login or session-status page for agent `N`; `https://<base_virtualhost>/hermes-N/dashboard/...` serves the Hermes dashboard and `https://<base_virtualhost>/hermes-N/chat/...` serves the Open WebUI chat sidecar through the auth proxy.
 The auth proxy logs `auth_attempt`, `auth_success`, `auth_failed`, and `proxy_failed` events to standard output for troubleshooting published dashboard access. When `DEBUG=1` or `AUTH_PROXY_DEBUG=1`, it also logs `request_received` for inbound requests and `proxy_forward` with the resolved upstream URL before forwarding. If the assigned dashboard upstream is temporarily unavailable, the proxy returns HTTP 502 instead of terminating the app.
 
 ## Runtime unit
 
-The shipped user units are `imageroot/systemd/user/hermes@.service`, `imageroot/systemd/user/hermes-socket@.service`, `imageroot/systemd/user/hermes-auth.service`, and `imageroot/systemd/user/hermes-pod@.service`.
+The shipped user units are `imageroot/systemd/user/hermes@.service`, `imageroot/systemd/user/openwebui@.service`, `imageroot/systemd/user/hermes-socket@.service`, `imageroot/systemd/user/openwebui-socket@.service`, `imageroot/systemd/user/hermes-auth.service`, and `imageroot/systemd/user/hermes-pod@.service`.
 
 Each started agent runs:
 
-- one primary `systemctl --user` service instance: `hermes@<id>.service`
-- one per-agent socket relay service instance: `hermes-socket@<id>.service`
+- one primary Hermes gateway service instance: `hermes@<id>.service`
+- one Open WebUI sidecar service instance: `openwebui@<id>.service`
+- one Hermes dashboard socket relay service instance: `hermes-socket@<id>.service`
+- one Open WebUI chat socket relay service instance: `openwebui-socket@<id>.service`
 - one Podman pod: `hermes-pod-<id>`
 - one Hermes container: `hermes-<id>`
-- one socket relay container: `hermes-socket-<id>`
+- one Open WebUI container: `openwebui-<id>`
+- one dashboard socket relay container: `hermes-socket-<id>`
+- one chat socket relay container: `openwebui-socket-<id>`
 - one Podman-managed Hermes home volume mounted at `/opt/data`
-- one per-agent dashboard socket at `%S/state/dashboard-sockets/agent-<id>.sock`, mounted into `hermes-auth` as `/sockets/agent-<id>.sock`
+- one per-agent dashboard socket at `%S/state/dashboard-sockets/agent-<id>-dashboard.sock`, mounted into `hermes-auth` as `/sockets/agent-<id>-dashboard.sock`
+- one per-agent chat socket at `%S/state/dashboard-sockets/agent-<id>-chat.sock`, mounted into `hermes-auth` as `/sockets/agent-<id>-chat.sock`
 
 Shared publishing also runs:
 
@@ -258,7 +265,7 @@ Shared publishing also runs:
 Restart supervision is owned by the systemd user units with `Restart=on-failure`; the Podman pod and container launches do not set container-level restart policies.
 The shipped services create one named volume per agent mounted at `/opt/data`.
 Managed `SOUL.md` and home `.env` seeding runs before service start in `configure-module/75seed-agent-home`; later agent edits preserve existing files inside the volume.
-The Hermes container reads `agent_<id>.env` and `agent_<id>_secrets.env`, mounts the shared home volume, and runs `hermes dashboard --host 127.0.0.1 --port 9120 --insecure --no-open -- gateway run` inside the pod. The per-agent socket sidecar relays that listener onto `%S/state/dashboard-sockets/agent-<id>.sock`. The shared auth proxy container reads `authproxy.env`, `authproxy_secrets.env`, and `authproxy_agents.json`, mounts `%S/state/dashboard-sockets:/sockets:z`, authenticates the shared route against LDAP, preserves the dashboard upstream `Authorization` header, injects a trusted `X-Hermes-Authenticated-User` header derived from the authenticated session username while ignoring any client-supplied value for that header, logs auth events to stdout, and proxies requests to the assigned per-agent `upstream_socket`.
+The Hermes container reads `agent_<id>.env` and `agent_<id>_secrets.env`, mounts the shared home volume, and runs `hermes gateway run` inside the pod. The Open WebUI sidecar runs in the same pod with its built-in authentication disabled and consumes the generated per-agent API token from `agent_<id>_secrets.env`. The dashboard relay exposes Hermes on `%S/state/dashboard-sockets/agent-<id>-dashboard.sock`, and the chat relay exposes Open WebUI on `%S/state/dashboard-sockets/agent-<id>-chat.sock`. The shared auth proxy container reads `authproxy.env`, `authproxy_secrets.env`, and `authproxy_agents.json`, mounts `%S/state/dashboard-sockets:/sockets:z`, authenticates the shared route against LDAP, preserves the dashboard upstream `Authorization` header, injects a trusted `X-Hermes-Authenticated-User` header derived from the authenticated session username while ignoring any client-supplied value for that header, logs auth events to stdout, and proxies `/hermes-<id>/dashboard/...` to `dashboard_upstream_socket` and `/hermes-<id>/chat/...` to `chat_upstream_socket`.
 If `base_virtualhost` is set, Traefik forwards `https://<base_virtualhost>/` directly to the shared auth proxy listener. No per-agent path route, `strip_prefix`, or `X-Forwarded-Prefix` header is required.
 
 ## UI development

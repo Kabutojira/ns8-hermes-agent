@@ -23,6 +23,7 @@ SESSION_COOKIE = "hermes_dashboard_session"
 SESSION_TTL_SECONDS = 8 * 60 * 60
 LOGIN_PATH = "/login"
 LOGOUT_PATH = "/logout"
+CHAT_ALIAS_PATH = "/chat"
 TARGET_PATH_PATTERN = re.compile(r"^/hermes-(\d+)(?:/(dashboard|chat)(?:/.*)?|/?)$")
 AUTHENTICATED_USER_HEADER = "X-Hermes-Authenticated-User"
 HOP_BY_HOP_HEADERS = {
@@ -296,6 +297,30 @@ def target_agent_id(path):
     return route[0]
 
 
+def is_chat_alias_path(path):
+    value = normalized_path(path)
+    return value == CHAT_ALIAS_PATH or value.startswith(f"{CHAT_ALIAS_PATH}/")
+
+
+def app_name_for_request_path(path, explicit_app=None):
+    if explicit_app is not None:
+        return explicit_app
+    if is_chat_alias_path(path):
+        return "chat"
+    return "dashboard"
+
+
+def public_prefix_for_request_path(path, app_name):
+    if app_name != "chat":
+        return ""
+    route = target_route(path)
+    if route is not None and route[1] == "chat":
+        return f"/hermes-{route[0]}/chat"
+    if is_chat_alias_path(path):
+        return CHAT_ALIAS_PATH
+    return ""
+
+
 def normalized_path(path):
     value = path or "/"
     if not value.startswith("/"):
@@ -558,6 +583,7 @@ def status_page_response(session_data, current_path):
       <p>{escape(helper)}</p>
       <div class=\"actions\">
         <a href=\"/\">Open dashboard</a>
+        <a href=\"{CHAT_ALIAS_PATH}\">Open chat</a>
         <form method=\"post\" action=\"{LOGOUT_PATH}\">
           <input type=\"hidden\" name=\"return_to\" value=\"{escape(current_path)}\" />
           <button type=\"submit\">Log out</button>
@@ -644,15 +670,19 @@ def upstream_headers(request, authenticated_username=""):
     return forwarded_headers
 
 
-def response_headers(upstream_response, upstream_base_url):
+def response_headers(upstream_response, upstream_base_url, public_prefix=""):
     headers = {}
     for name, value in upstream_response.headers.items():
         lower_name = name.lower()
         if lower_name in HOP_BY_HOP_HEADERS or lower_name == "content-length":
             continue
-        if lower_name == "location" and value.startswith(upstream_base_url):
-            rewritten = value[len(upstream_base_url) :]
-            headers[name] = rewritten or "/"
+        if lower_name == "location":
+            rewritten = value
+            if value.startswith(upstream_base_url):
+                rewritten = value[len(upstream_base_url) :] or "/"
+            if public_prefix and rewritten.startswith("/") and not rewritten.startswith(f"{public_prefix}/"):
+                rewritten = f"{public_prefix}{rewritten}" if rewritten != "/" else public_prefix
+            headers[name] = rewritten
             continue
         headers[name] = value
     return headers
@@ -665,7 +695,10 @@ def upstream_path_for_request(request, app_name):
         if app_name == "dashboard":
             prefix = f"/hermes-{target_agent_id(path)}/dashboard" if target_route(path) else None
         elif app_name == "chat":
-            prefix = f"/hermes-{target_agent_id(path)}/chat" if target_route(path) else None
+            if is_chat_alias_path(path):
+                prefix = CHAT_ALIAS_PATH
+            else:
+                prefix = f"/hermes-{target_agent_id(path)}/chat" if target_route(path) else None
         if prefix and path.startswith(prefix):
             stripped = path[len(prefix):]
             return stripped or "/"
@@ -701,7 +734,7 @@ def upstream_client_for_agent(request, agent_record, app_name):
     return client
 
 
-async def proxy_to_agent(agent_record, request, authenticated_username="", app_name="dashboard"):
+async def proxy_to_agent(agent_record, request, authenticated_username="", app_name="dashboard", public_prefix=""):
     if not agent_record.has_upstream_for(app_name):
         return upstream_unavailable_response(app_name)
 
@@ -734,7 +767,7 @@ async def proxy_to_agent(agent_record, request, authenticated_username="", app_n
     return Response(
         content=upstream_response.content,
         status_code=upstream_response.status_code,
-        headers=response_headers(upstream_response, agent_record.upstream_origin),
+        headers=response_headers(upstream_response, agent_record.upstream_origin, public_prefix=public_prefix),
     )
 
 
@@ -876,11 +909,13 @@ async def proxy(path: str, request: Request):
         )
         return route_mismatch_response()
 
+    requested_app = app_name_for_request_path(current_path, explicit_app)
     return await proxy_to_agent(
         session_data["agent"],
         request,
         authenticated_username=session_data["username"],
-        app_name=explicit_app or "dashboard",
+        app_name=requested_app,
+        public_prefix=public_prefix_for_request_path(current_path, requested_app),
     )
 
 
